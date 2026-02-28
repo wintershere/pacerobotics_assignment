@@ -26,11 +26,9 @@ From the Isaac Sim workspace root (`c:\isaac-sim`) in PowerShell:
 
 ```powershell
 cd .\extsUser
-git clone <github-repo-url> ekf
+git clone https://github.com/wintershere/pacerobotics_assignment.git ekf
 cd ..
 ```
-
-Replace `<github-repo-url>` with your actual repository URL.
 
 ## How to run
 
