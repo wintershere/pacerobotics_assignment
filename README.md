@@ -32,14 +32,16 @@ cd ..
 
 ## How to run
 
-From the workspace root (`c:\isaac-sim`) in PowerShell, Clone the repo into `\extsUser`:
-git clone
+From the workspace root (`c:\isaac-sim`) in PowerShell:
 
-1. Start Isaac Sim and load this extension:
+1. Launch Isaac Sim and enable this extension:
 
 ```powershell
-.\isaac-sim.bat --ext-folder .\extsUser --enable EKF_implement
+.\isaac-sim.bat --ext-folder .\extsUser --enable ekf
 ```
+
+
+If Isaac Sim is already running, enable it from **Window > Extensions** by searching for `ekf`.
 
 2. In Isaac Sim, open the extension window from the menu entry **EKF_implement**.
 3. Typical flow in the extension UI:
