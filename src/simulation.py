@@ -5,6 +5,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -25,7 +26,6 @@ from .ekf import (
     ScriptedFigure8,
     propagate_unicycle,
     quat_wxyz_to_yaw,
-    simulate_landmark_measurement,
     rb_to_xy_robot_frame,
     wrap_angle,
     save_csv,
@@ -34,7 +34,7 @@ from .ekf import (
     save_measurement_plot,
     save_landmark_noise_snapshot,
 )
-from .analysis import run_mc_trials, save_mc_results, save_variance_sweep
+from .analysis import run_mc_trials, save_mc_results, save_variance_sweep, capture_pointcloud
 from .global_variables import OUTPUT_ROOT_DIR
 
 
@@ -219,8 +219,10 @@ class EkfScenario:
     and accumulates logs for later export.
     """
 
-    def __init__(self, robot_base_prim_path: str = RobotScene.BASE_PATH):
+    def __init__(self, robot_base_prim_path: str = RobotScene.BASE_PATH,
+                 lidar_prim_path: str = RobotScene.LIDAR_PATH):
         self._robot_base_prim_path = robot_base_prim_path
+        self._lidar_prim_path = lidar_prim_path
         self._robot_xform: Optional[SingleXFormPrim] = None
 
         # Robot geometry (kept in sync with RobotScene)
@@ -238,8 +240,8 @@ class EkfScenario:
         ]
 
         # Noise parameters
-        self.sigma_v = 0.05   # odometry linear velocity
-        self.sigma_w = 0.05   # odometry angular velocity
+        self.sigma_v = 0.2   # odometry linear velocity
+        self.sigma_w = 0.3   # odometry angular velocity
         self.sigma_r = 0.03   # landmark range
         self.sigma_b = np.deg2rad(2.0)  # landmark bearing
 
@@ -299,10 +301,6 @@ class EkfScenario:
 
         self._create_landmark_visuals()
 
-        # Sync EKF noise matrices to the scenario noise parameters.
-        self._ekf.R   = np.diag([self.sigma_r, self.sigma_b]) ** 2
-        self._ekf.Q_u = np.diag([self.sigma_v, self.sigma_w]) ** 2
-
         gt = self._gt_pose()
         self._ekf.reset(gt)
         self._odom_state  = gt.copy()
@@ -346,28 +344,66 @@ class EkfScenario:
         self._ekf.predict(v_meas, w_meas, dt)
         self._odom_state = propagate_unicycle(self._odom_state, v_meas, w_meas, dt)
 
-        # Landmark updates
-        clean_xy, noisy_xy, num_meas = [], [], 0
-        for lm in self.landmarks:
-            pair = simulate_landmark_measurement(
-                gt_pose=gt, landmark_xy=lm, rng=self._rng,
-                sigma_r=self.sigma_r, sigma_b=self.sigma_b,
-                max_range_m=self.lidar_max_range_m,
-                half_fov_rad=self.lidar_half_fov_rad,
-                detection_prob=self.landmark_detect_prob,
-            )
-            if pair is None:
-                continue
-            z_clean, z_noisy = pair
-            self._ekf.update_landmark(z_noisy, lm)
-            num_meas += 1
-            clean_xy.append(rb_to_xy_robot_frame(z_clean))
-            noisy_xy.append(rb_to_xy_robot_frame(z_noisy))
+        # ── Landmark updates from real LiDAR point cloud ──────────────────────
+        # Capture the live point cloud from the PhysX LiDAR prim.
+        # Returns (N, 3) in sensor frame. Empty array means LiDAR buffer has
+        # not populated yet (needs >= 1 full rotation at 10 Hz = 6 frames).
+        # We skip EKF updates entirely until data is available — no silent
+        # fallback to analytical measurements.
+        num_meas = 0
+        meas_xy  = []   # for snapshot visualisation
 
-        if clean_xy:
-            self._snap_clean = np.asarray(clean_xy, dtype=float)
-            self._snap_noisy = np.asarray(noisy_xy, dtype=float)
-            self._snap_time  = self._t
+        try:
+            pc = capture_pointcloud(self._lidar_prim_path, tries=1)
+        except Exception as exc:
+            carb.log_warn(f"[EKF] LiDAR capture failed: {exc}")
+            pc = np.zeros((0, 3), dtype=float)
+
+        if len(pc) > 0:
+            points_2d = pc[:, :2]   # (N, 2) sensor-frame XY — z dropped
+
+            for lm in self.landmarks:
+                # Project landmark into sensor frame using current EKF estimate
+                px, py, th = self._ekf.x
+                lx, ly = float(lm[0]), float(lm[1])
+
+                # Landmark in sensor frame (sensor is mounted at robot centre,
+                # same xy as robot base, so transform = rotate by -yaw)
+                dlx = lx - px
+                dly = ly - py
+                lm_sensor = np.array([
+                     dlx * math.cos(-th) - dly * math.sin(-th),
+                     dlx * math.sin(-th) + dly * math.cos(-th),
+                ], dtype=float)
+
+                # Find the nearest LiDAR return to the projected landmark
+                dists = np.linalg.norm(points_2d - lm_sensor, axis=1)
+                nearest_idx = int(np.argmin(dists))
+
+                # Gate: only associate if nearest return is within 0.5 m of
+                # the expected landmark position in sensor frame.
+                # This prevents spurious wall returns being fed to the EKF.
+                if dists[nearest_idx] > 0.5:
+                    continue
+
+                nearest_xy = points_2d[nearest_idx]   # (x, y) sensor frame
+
+                # Convert to range / bearing — directly compatible with
+                # update_landmark() which expects z = [range, bearing]
+                r = float(np.sqrt(nearest_xy[0]**2 + nearest_xy[1]**2))
+                b = float(math.atan2(nearest_xy[1], nearest_xy[0]))
+                z_lidar = np.array([r, b], dtype=float)
+
+                self._ekf.update_landmark(z_lidar, lm)
+                num_meas += 1
+                meas_xy.append(nearest_xy.copy())
+
+            if meas_xy:
+                self._snap_noisy = np.asarray(meas_xy, dtype=float)
+                self._snap_clean = self._snap_noisy   # no separate clean for real LiDAR
+                self._snap_time  = self._t
+        else:
+            carb.log_warn(f"[EKF] t={self._t:.2f}s: LiDAR not ready, skipping updates")
 
         self.log_t.append(self._t)
         self.log_gt.append(gt.copy())
